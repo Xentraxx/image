@@ -1,3 +1,5 @@
+import 'dart:typed_data';
+
 import '../util/input_buffer.dart';
 import '../util/output_buffer.dart';
 import 'exif_tag.dart';
@@ -5,11 +7,36 @@ import 'ifd_container.dart';
 import 'ifd_directory.dart';
 import 'ifd_value.dart';
 
+/// Tag id of [JPEGInterchangeFormat] (a.k.a. ThumbnailOffset): offset from
+/// the TIFF header to the embedded EXIF thumbnail (JPEG) payload, stored in
+/// IFD1.
+const exifThumbnailOffsetTag = 0x0201;
+
+/// Tag id of [JPEGInterchangeFormatLength] (a.k.a. ThumbnailLength): size in
+/// bytes of the embedded EXIF thumbnail payload, stored in IFD1.
+const exifThumbnailLengthTag = 0x0202;
+
 /// Stores EXIF data for an Image.
 class ExifData extends IfdContainer {
+  /// The raw bytes of the embedded EXIF thumbnail (a complete JPEG), if one
+  /// was present in IFD1. The thumbnail is referenced out-of-band by the
+  /// [exifThumbnailOffsetTag] / [exifThumbnailLengthTag] tags rather than
+  /// being stored as a regular IFD value, so it has to be round-tripped
+  /// separately from the directory entries.
+  ///
+  /// When non-empty, [write] appends these bytes after the IFD1 directory and
+  /// rewrites the offset/length tags to point at them. When empty, any stale
+  /// offset/length tags are dropped so the output never carries dangling
+  /// thumbnail pointers (see issue #793).
+  Uint8List? thumbnail;
+
   ExifData() : super();
 
-  ExifData.from(ExifData? other) : super.from(other);
+  ExifData.from(ExifData? other) : super.from(other) {
+    thumbnail = other?.thumbnail == null
+        ? null
+        : Uint8List.fromList(other!.thumbnail!);
+  }
 
   ExifData.fromInputBuffer(InputBuffer input) : super() {
     read(input);
@@ -98,6 +125,12 @@ class ExifData extends IfdContainer {
       directories['ifd0'] = IfdDirectory();
     }
 
+    // If a thumbnail payload is present, make sure IFD1 exists so the
+    // thumbnail offset/length tags and payload get written out.
+    if (thumbnail != null && thumbnail!.isNotEmpty) {
+      directories['ifd1'] ??= IfdDirectory();
+    }
+
     // Ensure deterministic ordering: IFD0 must be written first. Use an
     // explicit list of directory names so offsets and next-pointer values
     // are calculated consistently regardless of map insertion order.
@@ -110,9 +143,31 @@ class ExifData extends IfdContainer {
 
     var dataOffset = 8; // offset to first ifd block, from start of tiff header
     final offsets = <String, int>{};
+    // Offset (from the TIFF header) where the embedded EXIF thumbnail
+    // payload will be written, if any. Computed in the first pass below and
+    // consumed in the second pass when writing IFD1.
+    var thumbnailOffset = -1;
 
     for (final name in dirNames) {
       final ifd = directories[name]!;
+
+      // Reconcile the IFD1 thumbnail tags with the actual thumbnail
+      // payload. If we have thumbnail bytes, make sure both the offset and
+      // length tags are present (their values are finalised below once the
+      // thumbnail offset is known). If there is no thumbnail, drop any
+      // stale offset/length tags so the output never carries dangling
+      // pointers (see issue #793).
+      if (name == 'ifd1') {
+        if (thumbnail != null && thumbnail!.isNotEmpty) {
+          ifd[exifThumbnailOffsetTag] ??= IfdValueLong(0);
+          ifd[exifThumbnailLengthTag] ??= IfdValueLong(thumbnail!.length);
+          ifd[exifThumbnailLengthTag]!.setInt(thumbnail!.length);
+        } else {
+          ifd.data.remove(exifThumbnailOffsetTag);
+          ifd.data.remove(exifThumbnailLengthTag);
+        }
+      }
+
       offsets[name] = dataOffset;
 
       if (ifd.sub.containsKey('exif')) {
@@ -142,6 +197,14 @@ class ExifData extends IfdContainer {
         if (dataSize > 4) {
           dataOffset += dataSize;
         }
+      }
+
+      // The thumbnail payload is appended after the IFD1 directory entries,
+      // the next-IFD pointer, and any large tag values. Record its offset
+      // now so the 0x0201 tag can point at it.
+      if (name == 'ifd1' && thumbnail != null && thumbnail!.isNotEmpty) {
+        thumbnailOffset = dataOffset;
+        dataOffset += thumbnail!.length;
       }
 
       // storage for sub-ifd blocks
@@ -176,6 +239,12 @@ class ExifData extends IfdContainer {
         ifd[0x8825]!.setInt(offsets['gps']!);
       }
 
+      // Point the IFD1 thumbnail offset tag at the payload location
+      // computed in the first pass.
+      if (name == 'ifd1' && thumbnailOffset >= 0) {
+        ifd[exifThumbnailOffsetTag]!.setInt(thumbnailOffset);
+      }
+
       final ifdOffset = offsets[name]!;
       final dataOffset = ifdOffset + 2 + (12 * ifd.values.length) + 4;
 
@@ -189,6 +258,12 @@ class ExifData extends IfdContainer {
       }
 
       _writeDirectoryLargeValues(out, ifd);
+
+      // Append the thumbnail payload right after the IFD1 directory and its
+      // large tag values, matching the offset recorded above.
+      if (name == 'ifd1' && thumbnail != null && thumbnail!.isNotEmpty) {
+        out.writeBytes(thumbnail!);
+      }
 
       for (final subName in ifd.sub.keys) {
         final subIfd = ifd.sub[subName];
@@ -213,13 +288,13 @@ class ExifData extends IfdContainer {
       // be translated to the StripOffsets long type.
       final tagType =
           tag == stripOffsetTag && value.type == IfdValueType.undefined
-              ? IfdValueType.long
-              : value.type;
+          ? IfdValueType.long
+          : value.type;
 
       final tagLength =
           tag == stripOffsetTag && value.type == IfdValueType.undefined
-              ? 1
-              : value.length;
+          ? 1
+          : value.length;
 
       out
         ..writeUint16(tag)
@@ -295,7 +370,9 @@ class ExifData extends IfdContainer {
           break;
         }
         final dir = List<_ExifEntry>.generate(
-            numEntries, (i) => _readEntry(block, blockOffset));
+          numEntries,
+          (i) => _readEntry(block, blockOffset),
+        );
 
         for (final entry in dir) {
           if (entry.value != null) {
@@ -317,11 +394,7 @@ class ExifData extends IfdContainer {
       }
     }
 
-    const subTags = {
-      0x8769: 'exif',
-      0xA005: 'interop',
-      0x8825: 'gps',
-    };
+    const subTags = {0x8769: 'exif', 0xA005: 'interop', 0x8825: 'gps'};
 
     for (final d in directories.values) {
       for (final dt in subTags.keys) {
@@ -333,7 +406,9 @@ class ExifData extends IfdContainer {
             final directory = IfdDirectory();
             final numEntries = block.readUint16();
             final dir = List<_ExifEntry>.generate(
-                numEntries, (i) => _readEntry(block, blockOffset));
+              numEntries,
+              (i) => _readEntry(block, blockOffset),
+            );
 
             for (final entry in dir) {
               if (entry.value != null) {
@@ -345,6 +420,31 @@ class ExifData extends IfdContainer {
             // Malformed sub-IFD (e.g., GPS), skip it
             // Optionally log or collect error info here
             continue;
+          }
+        }
+      }
+    }
+
+    // Capture the embedded EXIF thumbnail (IFD1) payload, if any. The
+    // thumbnail is referenced out-of-band by the JPEGInterchangeFormat /
+    // JPEGInterchangeFormatLength tags (0x0201 / 0x0202), which point at a
+    // run of bytes stored after the IFD1 directory entries. Without this
+    // the bytes are lost on round-trip and the offset/length tags become
+    // dangling pointers (see issue #793).
+    final ifd1 = directories['ifd1'];
+    if (ifd1 != null) {
+      final offsetValue = ifd1[exifThumbnailOffsetTag];
+      final lengthValue = ifd1[exifThumbnailLengthTag];
+      if (offsetValue != null && lengthValue != null) {
+        final thumbOffset = offsetValue.toInt();
+        final thumbLength = lengthValue.toInt();
+        if (thumbOffset > 0 && thumbLength > 0) {
+          final start = blockOffset + thumbOffset;
+          if (start + thumbLength <= block.end) {
+            block.offset = start;
+            thumbnail = Uint8List.fromList(
+              block.readBytes(thumbLength).toUint8List(),
+            );
           }
         }
       }

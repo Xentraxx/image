@@ -65,10 +65,20 @@ class JpegUtil {
     var hasExifBlock = false;
     var exifBlockEndOffset = 0;
     final startOffset = input.offset;
+    // Position in the input where the EXIF APP1 block begins (i.e. the first
+    // 0xFF byte of its marker). Everything from `startOffset` up to here
+    // (typically the SOI + JFIF APP0 + any preceding APPn segments) must be
+    // preserved verbatim when the EXIF block is rewritten.
     var exifBlockStartOffset = startOffset;
+    // Offset of the first byte of the marker that `_nextMarker` is about to
+    // read. Recorded *before* the call so we know where the next block
+    // starts (the marker bytes themselves are consumed by `_nextMarker`).
+    var markerStartOffset = input.offset;
     marker = _nextMarker(input);
     while (!hasExifBlock && marker != JpegMarker.eoi && !input.isEOS) {
       if (marker == JpegMarker.app1) {
+        // This APP1 block starts at the marker bytes we just consumed.
+        exifBlockStartOffset = markerStartOffset;
         final block = _readBlock(input);
         final signature = block?.readUint32();
         if (signature == exifSignature) {
@@ -79,7 +89,11 @@ class JpegUtil {
       } else {
         _skipBlock(input);
       }
-      exifBlockStartOffset = startOffset;
+      // Advance the marker-start offset to the current position so the
+      // next iteration records the correct start of the following block.
+      // (Previously this reset to `startOffset`, which dropped every
+      // segment between SOI and the EXIF APP1 — e.g. the JFIF APP0.)
+      markerStartOffset = input.offset;
       marker = _nextMarker(input);
     }
 
